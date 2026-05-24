@@ -5,6 +5,7 @@ import { api } from "@/convex/_generated/api";
 import { OrchaFusion } from "./engine/orcha-fusion";
 import { classifyIntent } from "./intent-classifier";
 import { getNativeDialectRule, getFederatedRule } from "./dialects";
+import { buildManifest, validateSQL, CompiledManifest } from "./sql-validator";
 
 const MAX_ROWS = 50;
 const ALLOWED_SQL_PREFIXES = ["select", "show", "describe", "explain", "with"];
@@ -39,10 +40,20 @@ export async function createChatAgent(context: AgentContext) {
 
   const configId = activeConfigIds[0];
 
-  let config: any;
-  const allConfigs = await convex.query(api.databaseConfigs.listByOrganization, { organizationId, apiKey });
-  config = allConfigs.find((c: any) => c._id === configId);
+  // ── PARALLEL FETCH: Fire all org-level queries simultaneously ──
+  // allConfigs, aiKeys, integrationKeys, and allOrgModels are fully independent —
+  // bundling them into one Promise.all saves ~3 sequential network round-trips per request.
+  const [allConfigs, aiKeys, integrationKeys, allOrgModels] = await Promise.all([
+    convex.query(api.databaseConfigs.listByOrganization, { organizationId, apiKey }),
+    convex.query(api.aiKeys.listByOrganization, { organizationId, apiKey }),
+    convex.query(api.integrationKeys.listByOrganization, { organizationId, apiKey }),
+    convex.query(api.semanticModels.listAllModelsInOrg, { organizationId, apiKey }),
+  ]);
+
+  // Resolve the primary database config from the already-fetched list
+  let config: any = allConfigs.find((c: any) => c._id === configId);
   if (!config) {
+    // Fallback: fetch any ready config for the org (e.g. when no configId is supplied)
     config = await convex.query(api.databaseConfigs.getByOrganization, { organizationId, apiKey });
   }
   if (!config) throw new Error("No ready database configuration found.");
@@ -55,7 +66,7 @@ export async function createChatAgent(context: AgentContext) {
     throw new Error("Failed to parse database configuration.");
   }
 
-  // Build a connection config map for the selected databases (for federation)
+  // Build the federation config map (uses allConfigs resolved above)
   const allOrgConfigs = allConfigs || [];
   const dbConfigMap = new Map<string, any>();
   const activeIdsSet = new Set(activeConfigIds);
@@ -70,11 +81,6 @@ export async function createChatAgent(context: AgentContext) {
     } catch { /* skip malformed configs */ }
   }
 
-  const [aiKeys, integrationKeys] = await Promise.all([
-    convex.query(api.aiKeys.listByOrganization, { organizationId, apiKey }),
-    convex.query(api.integrationKeys.listByOrganization, { organizationId, apiKey }),
-  ]);
-
   // If a default model is set for the API key, use it.
   const defaultModel = defaultModelId || "gemini:gemini-1.5-flash";
 
@@ -85,15 +91,20 @@ export async function createChatAgent(context: AgentContext) {
 
   let filteredModels: any[] = [];
   let relationships: any[] = [];
+  let recalledExemplars: any[] = [];
   let mcpTools: any = {};
+  // allModels (full field schemas) is fetched lazily inside the TEXT_TO_SQL branch
+  let allModels: any[] = [];
+  let compiledManifest: CompiledManifest = { tables: [], relationships: [] };
   const lastMessage = (messages[messages.length - 1] as any)?.content || "";
 
-  // --- INTENT CLASSIFICATION  ---
-  // 1. Get a quick list of table names to help the classifier
-  const allModels = await convex.query(api.semanticModels.listModelsByConfig, { configId: config._id, apiKey });
-  const tableNames = allModels.map((m: any) => m.displayName || m.tableName);
+  // --- INTENT CLASSIFICATION ---
+  // Derive table names from allOrgModels fetched in the parallel block above — zero extra cost.
+  const tableNames = allOrgModels
+    .filter((m: any) => m.configId === config._id)
+    .map((m: any) => m.displayName || m.tableName);
 
-  // 2. Classify intent (TEMPORARILY DISABLED)
+  // classifyIntent is temporarily commented out for now
   // const classification = await classifyIntent(lastMessage, aiModel, tableNames, config.businessContext);
   // const messageIntent = classification.intent;
   // const suggestedTables = classification.suggestedTables;
@@ -101,41 +112,94 @@ export async function createChatAgent(context: AgentContext) {
   const suggestedTables: string[] = [];
   console.log(`[Agent] Intent Classification bypassed, defaulting to: ${messageIntent}`);
 
-  // Run MCP tool loading in the background
-  const mcpLoadPromise = (async () => {
-    const { loadMcpTools } = (await import("@/lib/mcp-loader")) as any;
-    return await loadMcpTools(integrationKeys, orgIdStr);
-  })();
-
   // Only run the expensive RAG pipeline for data queries
   if (messageIntent === "TEXT_TO_SQL") {
-    const ragPromise = (async () => {
-      const embedProvider: "openai" | "gemini" | "local" = (config.memoryProvider as any) || "gemini";
-      const { embedding, dimensions } = await convex.action(api.embeddings.generateEmbedding, {
-        organizationId: organizationId as any,
-        text: lastMessage,
-        provider: embedProvider,
-        sysApiKey: apiKey,
-      });
-      const indexName = dimensions === 1536 ? "by_embedding_1536" :
-        dimensions === 1024 ? "by_embedding_1024" : "by_embedding_768";
-      return await convex.action(api.semanticModels.retrieveSchemaContext, {
-        configId: config._id,
-        embedding,
-        indexName,
-        limit: 10,
-        apiKey,
-      });
+    // ── CONCURRENT TEXT_TO_SQL LOAD ──
+    // MCP tools, RAG embedding + vector search, and full model schemas all fire in parallel.
+    // Previously these were sequential; now they all complete in the time of the slowest one.
+    const mcpLoadPromise = (async () => {
+      const { loadMcpTools } = (await import("@/lib/mcp-loader")) as any;
+      return await loadMcpTools(integrationKeys, orgIdStr);
     })();
 
-    const [mcpResult, ragResult] = await Promise.allSettled([mcpLoadPromise, ragPromise]);
+    const ragAndRecallPromise = (async () => {
+      try {
+        const embedProvider: "openai" | "gemini" | "local" = (config.memoryProvider as any) || "gemini";
+        const { embedding, dimensions } = await convex.action(api.embeddings.generateEmbedding, {
+          organizationId: organizationId as any,
+          text: lastMessage,
+          provider: embedProvider,
+          sysApiKey: apiKey,
+        });
+        const indexName = dimensions === 1536 ? "by_embedding_1536" :
+          dimensions === 1024 ? "by_embedding_1024" : "by_embedding_768";
+
+        const [ragResult, recallResult] = await Promise.all([
+          convex.action(api.semanticModels.retrieveSchemaContext, {
+            configId: config._id,
+            embedding,
+            indexName,
+            limit: 10,
+            apiKey,
+          }).catch((err: any) => {
+            console.warn("[Agent] retrieveSchemaContext error:", err);
+            return { models: [], relationships: [] };
+          }),
+          convex.action(api.semanticMemory.recallQueries, {
+            organizationId: organizationId as any,
+            configId: config._id,
+            embedding,
+            indexName,
+            limit: 3,
+            apiKey,
+          }).catch((err: any) => {
+            console.warn("[Agent] recallQueries error:", err);
+            return [];
+          })
+        ]);
+
+        return { ragResult, recallResult };
+      } catch (err) {
+        console.error("[Agent] dynamic embedding/recall pipeline failed:", err);
+        return { ragResult: { models: [], relationships: [] }, recallResult: [] };
+      }
+    })();
+
+    // Full model schemas (with fields) for ALL active configs — primary + federated secondaries.
+    // Running all fetches in parallel so federated mode pays no extra sequential cost.
+    const allModelsPromises = activeConfigIds.map((cid: string) =>
+      convex.query(api.semanticModels.listModelsByConfig, { configId: cid as any, apiKey })
+        .catch(() => [] as any[])
+    );
+    const allModelsPromise = Promise.all(allModelsPromises);
+
+    const [mcpResult, pipelineResult, allModelsResult] = await Promise.allSettled([
+      mcpLoadPromise,
+      ragAndRecallPromise,
+      allModelsPromise,
+    ]);
 
     if (mcpResult.status === "fulfilled") mcpTools = mcpResult.value;
 
-    if (ragResult.status === "fulfilled" && ragResult.value?.models?.length > 0) {
-      filteredModels = ragResult.value.models;
-      relationships = ragResult.value.relationships;
+    if (pipelineResult.status === "fulfilled") {
+      const { ragResult, recallResult } = pipelineResult.value;
+      if (ragResult?.models?.length > 0) {
+        filteredModels = ragResult.models;
+        relationships = ragResult.relationships;
+      }
+      recalledExemplars = recallResult || [];
     }
+
+    // Merge all models from all active configs into one flat array for fuzzy fallback & search_db_schema
+    if (allModelsResult.status === "fulfilled") {
+      const perConfigResults = allModelsResult.value as any[][];
+      allModels = perConfigResults.flat();
+    }
+
+    // Build the compiled manifest for pre-execution dry-plan validation.
+    // Done here so it uses the fully merged allModels + relationships from dependency expansion.
+    // NOTE: relationships is populated later in Stage 2 expansion below; manifest is rebuilt after.
+    compiledManifest = buildManifest(allModels, relationships, dbConfigMap, allOrgConfigs);
 
     // HYBRID DISCOVERY: Merge LLM-suggested tables with RAG results
     if (suggestedTables.length > 0) {
@@ -155,9 +219,11 @@ export async function createChatAgent(context: AgentContext) {
           newModelIds.add(sm._id);
         }
       }
+    }
 
-      // Stage 2: DEPENDENCY EXPANSION 
-      // Pull in 1st-degree relationships for any table we've found so far
+    // Stage 2: DEPENDENCY EXPANSION 
+    // Pull in 1st-degree relationships for any table we've found so far
+    if (filteredModels.length > 0) {
       const allRels = await convex.query(api.semanticRelationships.listByConfig, { configId: config._id, apiKey });
       const expandedIds = new Set(filteredModels.map(m => m._id));
 
@@ -179,10 +245,15 @@ export async function createChatAgent(context: AgentContext) {
           }
         }
       }
+
+      // Rebuild manifest now that relationships are fully expanded
+      compiledManifest = buildManifest(allModels, relationships, dbConfigMap, allOrgConfigs);
     }
   } else {
-    // GENERAL / IRRELEVANT: skip RAG, just load MCP tools
-    mcpTools = await mcpLoadPromise;
+    // GENERAL / IRRELEVANT: skip the entire RAG + embedding pipeline.
+    // Only load MCP tools in case the user is asking about an integration.
+    const { loadMcpTools } = (await import("@/lib/mcp-loader")) as any;
+    mcpTools = await loadMcpTools(integrationKeys, orgIdStr);
     console.log(`[Agent] Skipped RAG pipeline for intent: ${messageIntent}`);
   }
 
@@ -208,12 +279,12 @@ export async function createChatAgent(context: AgentContext) {
   }
 
   // --- COLUMN PRUNING ---
-  // Only prune when there are genuinely many columns (> 60 total).
+  // Only prune when there are genuinely many columns (> 150 total).
   // For small/simple schemas, pruning adds an extra LLM call with no benefit
   // and can actually hurt accuracy by stripping columns the AI needs.
   if (messageIntent === "TEXT_TO_SQL" && filteredModels.length > 0) {
     const totalColumns = filteredModels.reduce((sum: number, m: any) => sum + (m.fields?.length || 0), 0);
-    if (totalColumns > 60) {
+    if (totalColumns > 150) {
       try {
         const pruned = await pruneColumns(lastMessage, filteredModels, relationships, pruningModel);
         filteredModels = pruned;
@@ -264,22 +335,40 @@ export async function createChatAgent(context: AgentContext) {
     }).join("\n")
     : "";
 
-  // Build a federated catalog for the prompt (only for selected databases)
-  const allOrgModels = await convex.query(api.semanticModels.listAllModelsInOrg, { organizationId, apiKey });
+  // Build a federated catalog for the prompt — includes FULL column schema per database.
+  // allModels already contains merged schemas for all active configs (loaded above).
   const federatedCatalog = allOrgConfigs
     .filter((c: any) => activeIdsSet.has(c._id))
     .map((c: any) => {
       const alias = c.name.toLowerCase().replace(/[^a-z0-9]/g, "_");
-      const dbTables = allOrgModels
-        .filter((m: any) => m.configId === c._id)
-        .map((m: any) => m.tableName)
-        .join(", ");
+      const dbModels = allModels.filter((m: any) => m.configId === c._id);
 
-      return `- [${c.type.toUpperCase()}] alias: **${alias}** (Tables: ${dbTables || "none detected"})`;
+      if (dbModels.length === 0) {
+        return `- [${c.type.toUpperCase()}] alias: **${alias}** (No tables detected — run a schema scan)`;
+      }
+
+      // For the primary config, schema is already in schemaDescription — skip duplication
+      if (c._id === config._id) {
+        const tableList = dbModels.map((m: any) => m.tableName).join(", ");
+        return `- [${c.type.toUpperCase()}] alias: **${alias}** — PRIMARY DB (Tables: ${tableList})`;
+      }
+
+      // For secondary databases: include full column schema so the agent never guesses
+      const tableSchemas = dbModels.map((m: any) => {
+        const cols = (m.fields || []).map((f: any) => {
+          let col = `    - ${f.columnName} (${f.type})`;
+          if (f.isPrimary) col += " PRIMARY KEY";
+          if (f.description) col += ` | ${f.description}`;
+          return col;
+        }).join("\n");
+        return `  ### ${m.tableName} (alias.table: ${alias}.${m.tableName})\n${cols}`;
+      }).join("\n");
+
+      return `- [${c.type.toUpperCase()}] alias: **${alias}**\n${tableSchemas}`;
     }).join("\n");
 
   const dialectRules = getNativeDialectRule(config.type);
-  const federatedRule = getFederatedRule(federatedCatalog, config.name);
+  const federatedRule = dbConfigMap.size > 1 ? getFederatedRule(federatedCatalog, config.name) : "";
 
   const buildSystemPrompt = (toolNames: string[]) => {
     const mcpToolNames = toolNames.filter(t => t !== "execute_sql");
@@ -290,6 +379,12 @@ ${mcpToolNames.map(n => `- ${n}`).join("\n")}
 `
       : "### AVAILABLE MCP TOOLS: No external integrations are connected yet.\n";
 
+    const exemplarsSection = recalledExemplars?.length > 0
+      ? "\n### FEW-SHOT EXAMPLES (PAST SUCCESSFUL QUERIES):\n" + recalledExemplars.map((ex: any, idx: number) => {
+        return `Example ${idx + 1}:\nNatural Language User Question: "${ex.question}"\nValid Dialect SQL Query: \`\`\`sql\n${ex.sql}\n\`\`\``;
+      }).join("\n\n") + "\n"
+      : "";
+
     return `You are Orcha Agent OS, a powerful AI system with dual capabilities: Data Analysis and Tool Integration.
 
 ${mcpSection}
@@ -298,6 +393,7 @@ ${mcpSection}
 ${tableDiscoveryList}
 ${schemaDescription}
 ${relationshipDescription}
+${exemplarsSection}
 
 ${dialectRules}
 ${federatedRule}
@@ -307,6 +403,24 @@ ${federatedRule}
 2. NATIVE FIRST: Prioritize the native SQL dialect mentioned above (e.g. use SELECT TOP for MSSQL).
 3. DISCOVERY: Use the provided schema context to identify tables and columns.
 4. LIMIT: Always limit results to ${MAX_ROWS} rows.
+
+### MANDATORY QUERY WORKFLOW  ALWAYS follow this order:
+
+Step 1 — CHECK SCHEMA FIRST (before writing any SQL):
+- Use search_db_schema to confirm EXACT table names and column names.
+- NEVER guess a column name. If you are unsure, call search_db_schema.
+- Example: search_db_schema({ query: "review" }) → confirms the correct column is "review_text", not "review_id".
+
+Step 2 — DRY-PLAN BEFORE EXECUTING (for any non-trivial JOIN or unfamiliar table):
+- Call dry_plan_sql with your intended SQL BEFORE calling execute_sql or execute_federated_sql.
+- If dry_plan_sql returns errors, fix the SQL and re-validate. Do NOT execute invalid SQL.
+- Only skip dry_plan_sql for single-table queries on tables you have already verified in Step 1.
+
+Step 3 — EXECUTE:
+- Only call execute_sql / execute_federated_sql after dry_plan_sql passes (or Step 1 fully confirmed the schema).
+
+Step 4 — STORE (automatic):
+- Successful queries are automatically stored in semantic memory. No action needed.
 
 ### REASONING PHASE (CRITICAL):
 - BEFORE providing any final answer or executing any tools, you MUST provide a brief "Thinking Process" to explain your logic to the user.
@@ -335,7 +449,85 @@ ${federatedRule}
   };
 
   // 7. Initialize Agent
-  const tools = {
+  const tools: any = {
+    search_db_schema: {
+      description: `[Step 1 — ALWAYS USE FIRST] Searches ALL connected databases for exact table names, column names, types, PKs, and join relationships. Call this BEFORE writing any SQL to confirm correct column names. Never guess — always verify here first.`,
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search term for tables or columns (e.g. 'review', 'customer_id', 'orders')." }
+        },
+        required: ["query"],
+      }),
+      execute: async ({ query }: { query: string }) => {
+        const lowerQuery = query.toLowerCase();
+        const matches = allModels.filter((m: any) => {
+          const tName = (m.tableName || "").toLowerCase();
+          const dName = (m.displayName || "").toLowerCase();
+          const desc = (m.description || "").toLowerCase();
+          const hasCol = m.fields?.some((f: any) =>
+            (f.columnName || "").toLowerCase().includes(lowerQuery) ||
+            (f.displayName || "").toLowerCase().includes(lowerQuery) ||
+            (f.description || "").toLowerCase().includes(lowerQuery)
+          );
+          return tName.includes(lowerQuery) || dName.includes(lowerQuery) || desc.includes(lowerQuery) || hasCol;
+        });
+
+        if (matches.length === 0) {
+          return { success: true, message: `No tables or columns found matching "${query}". Try a broader search term.` };
+        }
+
+        const matchDetails = matches.map((m: any) => {
+          const cfg = allOrgConfigs.find((c: any) => c._id === m.configId);
+          const dbAlias = cfg ? cfg.name.toLowerCase().replace(/[^a-z0-9]/g, "_") : "";
+          const tableRef = dbAlias ? `${dbAlias}.${m.tableName}` : m.tableName;
+          const matchedFields = (m.fields || []).map((f: any) => {
+            let colStr = `  - ${f.columnName} (${f.type})`;
+            if (f.isPrimary) colStr += " PRIMARY KEY";
+            if (f.description) colStr += ` | ${f.description}`;
+            return colStr;
+          }).join("\n");
+          // Also show relevant join conditions from the manifest
+          const joins = compiledManifest.relationships.filter(r =>
+            r.toLowerCase().includes(m.tableName.toLowerCase())
+          );
+          const joinSection = joins.length > 0
+            ? `\nJoin conditions:\n${joins.map(j => `  ${j}`).join("\n")}`
+            : "";
+          return `Table: ${tableRef}\nDescription: ${m.description || "None"}${joinSection}\nColumns:\n${matchedFields}`;
+        }).join("\n\n");
+
+        return {
+          success: true,
+          matchesCount: matches.length,
+          schemaDetails: matchDetails
+        };
+      }
+    },
+    dry_plan_sql: {
+      description: `[Step 2 — DRY-PLAN BEFORE EXECUTING] Validates SQL column and table references against the schema manifest WITHOUT executing it. Call this after search_db_schema and BEFORE execute_sql / execute_federated_sql for any JOIN query or unfamiliar table. Returns a list of errors to fix if any column or table name is wrong.`,
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          sql: { type: "string", description: "The SQL query to validate against the schema manifest." }
+        },
+        required: ["sql"],
+      }),
+      execute: async ({ sql }: { sql: string }) => {
+        const result = validateSQL(sql, compiledManifest);
+        if (result.valid) {
+          return {
+            valid: true,
+            message: "✅ Dry-plan passed. All table and column references are valid. You may now execute the SQL."
+          };
+        }
+        return {
+          valid: false,
+          errors: result.errors,
+          message: `❌ Dry-plan failed with ${result.errors.length} error(s). Fix these before executing:\n${result.errors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`
+        };
+      }
+    },
     execute_sql: {
       description: `Executes a SQL SELECT query. Use this tool for data analysis. DO NOT provide a chartConfig unless the user explicitly asked to visualize, chart, graph, or plot the data.`,
       inputSchema: jsonSchema({
@@ -358,9 +550,36 @@ ${federatedRule}
       }),
       execute: async ({ sql, chartConfig }: { sql: string; chartConfig?: any }) => {
         if (!isSafeSQL(sql)) return { success: false, error: "Unsafe SQL blocked." };
+
+        // Pre-execution dry-plan: validate column/table references before hitting the DB
+        const dryPlan = validateSQL(sql, compiledManifest);
+        if (!dryPlan.valid) {
+          console.warn("[Agent] execute_sql dry-plan failed:", dryPlan.errors);
+          return {
+            success: false,
+            dryPlanFailed: true,
+            errors: dryPlan.errors,
+            error: `Schema validation failed before execution. Fix these errors and use dry_plan_sql to re-verify:\n${dryPlan.errors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`
+          };
+        }
+
         try {
           const schemaName = config.name.toLowerCase().replace(/[^a-z0-9]/g, "_");
           const rows = await OrchaFusion.execute(sql, schemaName, dbConfig);
+
+          // Store successful query in Convex semanticMemory in background
+          try {
+            convex.mutation(api.semanticMemory.storeQueryMapping, {
+              organizationId: organizationId as any,
+              configId: config._id,
+              question: lastMessage,
+              sql: sql,
+              apiKey,
+            }).catch((e: any) => console.error("[Agent] Memory store deferred failure:", e));
+          } catch (e) {
+            console.error("[Agent] Memory store trigger failed:", e);
+          }
+
           return {
             success: true,
             data: rows.slice(0, MAX_ROWS),
@@ -371,7 +590,11 @@ ${federatedRule}
         }
       },
     },
-    execute_federated_sql: {
+  };
+
+  // Only expose federated queries if there are genuinely multiple databases selected
+  if (dbConfigMap.size > 1) {
+    tools.execute_federated_sql = {
       description: `Executes a SQL query that JOINs data across MULTIPLE databases using alias.table syntax. Use this ONLY when the user needs data from more than one connected database. Do NOT use chartConfig unless the user explicitly asked for a visualization.`,
       inputSchema: jsonSchema({
         type: "object",
@@ -393,9 +616,36 @@ ${federatedRule}
       }),
       execute: async ({ sql, chartConfig }: { sql: string; chartConfig?: any }) => {
         if (!isSafeSQL(sql)) return { success: false, error: "Unsafe SQL blocked." };
+
+        // Pre-execution dry-plan: validate column/table references across all federated DBs
+        const dryPlan = validateSQL(sql, compiledManifest);
+        if (!dryPlan.valid) {
+          console.warn("[Agent] execute_federated_sql dry-plan failed:", dryPlan.errors);
+          return {
+            success: false,
+            dryPlanFailed: true,
+            errors: dryPlan.errors,
+            error: `Schema validation failed before federated execution. Fix these errors and use dry_plan_sql to re-verify:\n${dryPlan.errors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`
+          };
+        }
+
         try {
           console.log("[Agent] Executing FEDERATED query across", dbConfigMap.size, "databases");
           const rows = await OrchaFusion.executeMulti(sql, dbConfigMap);
+
+          // Store successful query in Convex semanticMemory in background
+          try {
+            convex.mutation(api.semanticMemory.storeQueryMapping, {
+              organizationId: organizationId as any,
+              configId: config._id,
+              question: lastMessage,
+              sql: sql,
+              apiKey,
+            }).catch((e: any) => console.error("[Agent] Memory store deferred failure:", e));
+          } catch (e) {
+            console.error("[Agent] Memory store trigger failed:", e);
+          }
+
           return {
             success: true,
             data: rows.slice(0, MAX_ROWS),
@@ -407,9 +657,11 @@ ${federatedRule}
           return { success: false, error: err.message || "Federated query failed." };
         }
       },
-    },
-    ...mcpTools,
-  };
+    };
+  }
+
+  // Merge loaded MCP tools
+  Object.assign(tools, mcpTools);
 
   const toolNames = Object.keys(tools);
   console.log(`[ChatAgent] Loaded tools: ${toolNames.join(", ")}`);

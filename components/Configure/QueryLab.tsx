@@ -16,7 +16,9 @@ import {
   Tabs,
   Accordion,
   ActionIcon,
-  Divider
+  Divider,
+  Alert,
+  Modal
 } from "@mantine/core";
 import {
   IconTerminal2,
@@ -29,7 +31,8 @@ import {
   IconTable,
   IconColumns,
   IconEdit,
-  IconTrash
+  IconTrash,
+  IconAlertCircle
 } from "@tabler/icons-react";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, usePaginatedQuery } from "convex/react";
@@ -69,6 +72,19 @@ export function QueryLab({ currentConfig, organization, currentUser, savedQuerie
   const [isExecuting, setIsExecuting] = useState(false);
   const [queryResults, setQueryResults] = useState<{ columns: string[], rows: any[], executionTime?: number } | null>(null);
   const [activeSidebarTab, setActiveSidebarTab] = useState<string | null>("schema");
+  const [librarySearch, setLibrarySearch] = useState("");
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [queryToDelete, setQueryToDelete] = useState<any>(null);
+
+  const filteredQueries = useMemo(() => {
+    // Only display standard connection queries; exclude AI/federated queries to avoid confusion
+    const list = savedQueries?.filter(q => !q.isFederated) || [];
+    if (!librarySearch.trim()) return list;
+    return list.filter(q => 
+      q.name.toLowerCase().includes(librarySearch.toLowerCase()) || 
+      (q.sql && q.sql.toLowerCase().includes(librarySearch.toLowerCase()))
+    );
+  }, [savedQueries, librarySearch]);
 
   const { results: semanticModels, status: modelsStatus, loadMore: loadMoreModels } = usePaginatedQuery(
     api.semanticModels.listModelSummariesByConfig, 
@@ -199,21 +215,10 @@ export function QueryLab({ currentConfig, organization, currentUser, savedQuerie
     }
   };
 
-  const handleDeleteQuery = async (e: React.MouseEvent, queryId: any) => {
+  const handleDeleteQuery = (e: React.MouseEvent, query: any) => {
     e.stopPropagation();
-    if (!confirm("Are you sure you want to delete this saved query?")) return;
-
-    try {
-      await removeQueryMutation({ queryId });
-      notifications.show({
-        title: "Query Deleted",
-        message: "The saved query has been removed from your library.",
-        color: "violet"
-      });
-    } catch (err: any) {
-      const message = typeof err.message === 'string' ? err.message : JSON.stringify(err);
-      notifications.show({ title: "Delete Failed", message, color: "red" });
-    }
+    setQueryToDelete(query);
+    setDeleteModalOpen(true);
   };
 
   const handleRenameQuery = async (e: React.MouseEvent, queryId: any, currentName: string) => {
@@ -445,19 +450,23 @@ export function QueryLab({ currentConfig, organization, currentUser, savedQuerie
                   size="xs"
                   styles={inputStyles}
                   leftSection={<IconSearch size={12} />}
+                  value={librarySearch}
+                  onChange={(e) => setLibrarySearch(e.currentTarget.value)}
                 />
 
                 <ScrollArea h={600}>
                   <Stack gap="xs">
-                    {savedQueries ? savedQueries.map((item) => (
+                    {filteredQueries.length > 0 ? filteredQueries.map((item) => (
                       <Paper key={item._id} p="xs" radius="xs" style={{ background: "rgba(147,51,234,0.03)", cursor: "pointer", border: "1px solid transparent" }}
                         onMouseEnter={(e) => e.currentTarget.style.borderColor = "rgba(147,51,234,0.3)"}
                         onMouseLeave={(e) => e.currentTarget.style.borderColor = "transparent"}
                         onClick={() => setSql(item.sql)}
                       >
-                        <Group justify="space-between" mb={4}>
-                          <Text size="xs" fw={700} c="white">{item.name}</Text>
-                          <Group gap={4}>
+                        <Group justify="space-between" mb={4} wrap="nowrap">
+                          <Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
+                            <Text size="xs" fw={700} c="white" truncate style={{ flex: 1 }}>{item.name}</Text>
+                          </Group>
+                          <Group gap={4} style={{ flexShrink: 0 }}>
                             <IconStar size={10} color="#a855f7" />
                             <ActionIcon
                               size="xs"
@@ -471,7 +480,7 @@ export function QueryLab({ currentConfig, organization, currentUser, savedQuerie
                               size="xs"
                               variant="subtle"
                               color="red"
-                              onClick={(e) => handleDeleteQuery(e, item._id)}
+                              onClick={(e) => handleDeleteQuery(e, item)}
                             >
                               <IconTrash size={10} />
                             </ActionIcon>
@@ -488,6 +497,66 @@ export function QueryLab({ currentConfig, organization, currentUser, savedQuerie
           </Tabs>
         </Paper>
       </Grid.Col>
+
+      <Modal
+        opened={deleteModalOpen}
+        onClose={() => {
+          setDeleteModalOpen(false);
+          setQueryToDelete(null);
+        }}
+        title="Delete Query"
+        centered
+        size="sm"
+        overlayProps={{ backgroundOpacity: 0.55, blur: 3 }}
+        styles={{
+          content: { background: "#130f22", border: "1px solid rgba(147,51,234,0.2)", borderRadius: 12 },
+          header: { background: "#130f22", color: "white" },
+          title: { fontWeight: 600 }
+        }}
+      >
+        <Stack gap="md">
+          <Text size="sm" c="rgba(255,255,255,0.7)">
+            Are you sure you want to delete <Text span fw={600} c="white">"{queryToDelete?.name}"</Text>? This action cannot be undone.
+          </Text>
+
+          <Group justify="flex-end" gap="sm">
+            <Button
+              variant="subtle"
+              color="gray"
+              onClick={() => {
+                setDeleteModalOpen(false);
+                setQueryToDelete(null);
+              }}
+              size="xs"
+            >
+              Cancel
+            </Button>
+            <Button
+              color="red"
+              onClick={async () => {
+                if (!queryToDelete) return;
+                try {
+                  await removeQueryMutation({ queryId: queryToDelete._id });
+                  notifications.show({
+                    title: "Query Deleted",
+                    message: `"${queryToDelete.name}" has been removed from your library.`,
+                    color: "violet"
+                  });
+                } catch (err: any) {
+                  const message = typeof err.message === 'string' ? err.message : JSON.stringify(err);
+                  notifications.show({ title: "Delete Failed", message, color: "red" });
+                } finally {
+                  setDeleteModalOpen(false);
+                  setQueryToDelete(null);
+                }
+              }}
+              size="xs"
+            >
+              Delete
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Grid>
   );
 }

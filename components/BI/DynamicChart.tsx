@@ -18,11 +18,11 @@ import {
   Cell,
   Legend,
 } from "recharts";
-import { Box, Text, Center, Loader, Stack, Group } from "@mantine/core";
+import { Box, Text, Center, Loader, Stack, Group, Table, ScrollArea } from "@mantine/core";
 
 interface DynamicChartProps {
   data: any[];
-  type: "bar" | "line" | "pie" | "area" | "kpi";
+  type: "bar" | "line" | "pie" | "area" | "kpi" | "table" | "counter";
   labelKey: string;
   valueKeys: string[];
   height?: number | string;
@@ -40,22 +40,50 @@ export function DynamicChart({
   isLoading
 }: DynamicChartProps) {
 
+  // Smart label key resolution: if the provided labelKey maps to numeric-looking values (IDs),
+  // auto-detect a better string column from the actual data as a fallback.
+  const resolvedLabelKey = useMemo(() => {
+    if (!data || data.length === 0) return labelKey;
+    if (labelKey.includes(",")) return labelKey;
+    const sampleValues = data.slice(0, 5).map(row => row[labelKey]);
+    const allNumeric = sampleValues.every(v => v !== undefined && v !== null && !isNaN(Number(v)) && String(v).trim() !== "");
+    if (allNumeric) {
+      // Find the first column that contains non-numeric, human-readable text values
+      const firstRow = data[0];
+      const stringCol = Object.keys(firstRow).find(col => {
+        if (col === labelKey) return false;
+        const val = firstRow[col];
+        return typeof val === "string" && isNaN(Number(val)) && val.trim().length > 0;
+      });
+      if (stringCol) {
+        console.warn(`[DynamicChart] labelKey "${labelKey}" resolved to numeric IDs. Auto-switching to "${stringCol}".`);
+        return stringCol;
+      }
+    }
+    return labelKey;
+  }, [data, labelKey]);
+
   // Format data for Recharts - ensure all numeric keys are parsed
   const formattedData = useMemo(() => {
     if (!data || data.length === 0) return [];
     return data.map((item) => {
       const formattedItem: any = { ...item };
-      formattedItem[labelKey] = String(item[labelKey] || "Unknown");
+      if (resolvedLabelKey.includes(",")) {
+        const keys = resolvedLabelKey.split(",").map(k => k.trim());
+        formattedItem[resolvedLabelKey] = keys.map(k => String(item[k] !== undefined ? item[k] : "")).filter(Boolean).join(" - ") || "Unknown";
+      } else {
+        formattedItem[resolvedLabelKey] = String(item[resolvedLabelKey] || "Unknown");
+      }
       valueKeys.forEach(key => {
         formattedItem[key] = parseFloat(String(item[key])) || 0;
       });
       return formattedItem;
     });
-  }, [data, labelKey, valueKeys]);
+  }, [data, resolvedLabelKey, valueKeys]);
 
   if (isLoading) {
     return (
-      <Center h={height}>
+      <Center style={{ height: "100%" }}>
         <Loader color="violet" size="sm" />
       </Center>
     );
@@ -63,7 +91,7 @@ export function DynamicChart({
 
   if (formattedData.length === 0) {
     return (
-      <Center h={height} style={{ border: "1px dashed rgba(255,255,255,0.1)", borderRadius: 8 }}>
+      <Center style={{ height: "100%", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: 8 }}>
         <Text size="xs" c="dimmed">No data available for visualization</Text>
       </Center>
     );
@@ -120,11 +148,102 @@ export function DynamicChart({
   // Render logic based on type
   const renderChart = () => {
     switch (type) {
+      case "table": {
+        const cols = Object.keys(data[0] || {});
+        return (
+          <Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <ScrollArea h="100%" className="rounded-lg border border-white/[0.06] bg-black/20" style={{ flex: 1 }}>
+              <Table variant="unstyled" style={{ color: "rgba(255,255,255,0.85)" }}>
+                <Table.Thead className="bg-[#120a2a]/80 backdrop-blur-md sticky top-0 z-10 border-b border-purple-500/25">
+                  <Table.Tr>
+                    {cols.map((col) => (
+                      <Table.Th 
+                        key={col} 
+                        className="text-purple-300/80 font-bold uppercase tracking-wider text-[10px] py-3.5 px-4 text-left border-b border-purple-500/20"
+                        style={{ borderBottom: "1px solid rgba(147, 51, 234, 0.25)" }}
+                      >
+                        {col.replace(/_/g, " ")}
+                      </Table.Th>
+                    ))}
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {data.map((row, rowIndex) => (
+                    <Table.Tr 
+                      key={rowIndex} 
+                      className="border-b border-white/[0.03] hover:bg-purple-500/[0.04] transition-colors duration-150"
+                      style={{ borderBottom: "1px solid rgba(255,255,255,0.03)" }}
+                    >
+                      {cols.map((col) => {
+                        const val = row[col];
+                        const displayVal = typeof val === "number" ? val.toLocaleString() : String(val ?? "");
+                        return (
+                          <Table.Td key={col} className="text-slate-200 font-medium text-[11px] py-3 px-4" style={{ whiteSpace: "nowrap" }}>
+                            {displayVal}
+                          </Table.Td>
+                        );
+                      })}
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </ScrollArea>
+          </Box>
+        );
+      }
+
+      case "kpi":
+      case "counter": {
+        const valueKey = valueKeys[0] || Object.keys(data[0] || {})[0];
+        let rawVal = 0;
+        if (data.length > 0) {
+          const isMultiple = data.length > 1;
+          if (isMultiple) {
+            rawVal = data.reduce((acc, row) => acc + (parseFloat(row[valueKey]) || 0), 0);
+          } else {
+            rawVal = parseFloat(data[0][valueKey]) || 0;
+          }
+        }
+
+        let displayVal = "";
+        if (rawVal >= 1_000_000_000) {
+          displayVal = `${(rawVal / 1_000_000_000).toFixed(1)}B`;
+        } else if (rawVal >= 1_000_000) {
+          displayVal = `${(rawVal / 1_000_000).toFixed(1)}M`;
+        } else if (rawVal >= 1_000) {
+          displayVal = `${(rawVal / 1_000).toFixed(1)}k`;
+        } else if (Number.isInteger(rawVal)) {
+          displayVal = rawVal.toLocaleString();
+        } else {
+          displayVal = rawVal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        const firstRowLabel = resolvedLabelKey ? data[0]?.[resolvedLabelKey] : undefined;
+
+        return (
+          <Center h="100%" p="md">
+            <Stack align="center" gap={2}>
+              <Text size="2.5rem" fw={800} style={{ 
+                background: "linear-gradient(135deg, #00D1FF 0%, #00FF94 100%)",
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+                letterSpacing: "-1px"
+              }}>
+                {displayVal}
+              </Text>
+              <Text size="11px" c="dimmed" fw={500} ta="center" style={{ textTransform: "uppercase", letterSpacing: "1px" }}>
+                {valueKey ? valueKey.replace(/_/g, " ") : ""} {firstRowLabel ? `(${firstRowLabel})` : ""}
+              </Text>
+            </Stack>
+          </Center>
+        );
+      }
+
       case "line":
         return (
           <LineChart data={formattedData}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis dataKey={labelKey} {...axisStyle} tickLine={false} axisLine={false} dy={10} />
+            <XAxis dataKey={resolvedLabelKey} {...axisStyle} tickLine={false} axisLine={false} dy={10} />
             <YAxis {...axisStyle} tickLine={false} axisLine={false} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v} />
             <Tooltip content={<CustomTooltip />} />
             {valueKeys.map((key, index) => {
@@ -160,7 +279,7 @@ export function DynamicChart({
               })}
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis dataKey={labelKey} {...axisStyle} tickLine={false} axisLine={false} dy={10} />
+            <XAxis dataKey={resolvedLabelKey} {...axisStyle} tickLine={false} axisLine={false} dy={10} />
             <YAxis {...axisStyle} tickLine={false} axisLine={false} />
             <Tooltip content={<CustomTooltip />} />
             {valueKeys.map((key, index) => {
@@ -193,7 +312,7 @@ export function DynamicChart({
               outerRadius={80}
               paddingAngle={5}
               dataKey={primaryValueKey}
-              nameKey={labelKey}
+              nameKey={resolvedLabelKey}
               stroke="none"
               labelLine={false}
               label={({ name, percent }) => `${name} ${((percent || 0) * 100).toFixed(0)}%`}
@@ -201,7 +320,7 @@ export function DynamicChart({
               {formattedData.map((entry, index) => (
                 <Cell
                   key={`cell-${index}`}
-                  fill={getSeriesColor(String(entry[labelKey]), index)}
+                  fill={getSeriesColor(String(entry[resolvedLabelKey]), index)}
                 />
               ))}
             </Pie>
@@ -220,7 +339,7 @@ export function DynamicChart({
         return (
           <BarChart data={formattedData}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis dataKey={labelKey} {...axisStyle} tickLine={false} axisLine={false} dy={10} />
+            <XAxis dataKey={resolvedLabelKey} {...axisStyle} tickLine={false} axisLine={false} dy={10} />
             <YAxis {...axisStyle} tickLine={false} axisLine={false} />
             <Tooltip content={<CustomTooltip />} cursor={{ fill: "rgba(255,255,255,0.03)" }} />
             {valueKeys.map((key, index) => {
@@ -233,7 +352,14 @@ export function DynamicChart({
                   fill={sColor}
                   radius={[4, 4, 0, 0]}
                   barSize={24}
-                />
+                >
+                  {valueKeys.length <= 1 && formattedData.map((entry, idx) => (
+                    <Cell
+                      key={`cell-${idx}`}
+                      fill={getSeriesColor(String(entry[resolvedLabelKey]), idx)}
+                    />
+                  ))}
+                </Bar>
               );
             })}
           </BarChart>
@@ -241,11 +367,22 @@ export function DynamicChart({
     }
   };
 
+  // The parent (DashboardGrid widget card) is position:absolute inset:0, so
+  // we use absolute fill here too — Recharts ResponsiveContainer will measure
+  // real pixel dimensions instead of getting -1.
+  const isRecharts = type !== "table" && type !== "kpi" && type !== "counter";
+
   return (
-    <Box h={height} w="100%">
-      <ResponsiveContainer width="100%" height="100%">
-        {renderChart()}
-      </ResponsiveContainer>
-    </Box>
+    <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
+      {isRecharts ? (
+        <ResponsiveContainer width="100%" height="100%">
+          {renderChart()}
+        </ResponsiveContainer>
+      ) : (
+        <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
+          {renderChart()}
+        </div>
+      )}
+    </div>
   );
 }

@@ -4,7 +4,6 @@ import {
   Stack,
   Group,
   ActionIcon,
-  MultiSelect,
   Checkbox,
   Text,
   Avatar,
@@ -13,19 +12,19 @@ import {
   Switch,
   Tooltip,
   Loader,
-  Select
+  Select,
+  Menu
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
-  IconPlus,
   IconAdjustmentsHorizontal,
   IconChevronDown,
-  IconMicrophone,
   IconArrowRight,
   IconSparkles,
   IconTable
 } from "@tabler/icons-react";
 import React, { useState, useEffect } from "react";
+import { MODEL_OPTIONS } from "@/lib/model-options";
 
 interface ChatPromptBoxProps {
   input: string;
@@ -41,48 +40,6 @@ interface ChatPromptBoxProps {
   showResults: boolean;
   setShowResults: (val: boolean) => void;
 }
-
-const MODEL_OPTIONS = [
-  {
-    group: "Google Gemini",
-    items: [
-      { value: "gemini:gemini-3.1-pro", label: "Gemini 3.1 Pro (High)" },
-      { value: "gemini:gemini-3.0-flash", label: "Gemini 3 Flash" },
-      { value: "gemini:gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-      { value: "gemini:gemini-1.5-pro", label: "Gemini 1.5 Pro" },
-      { value: "gemini:gemini-1.5-flash", label: "Gemini 1.5 Flash" },
-    ],
-  },
-  {
-    group: "OpenAI",
-    items: [
-      { value: "openai:gpt-5", label: "GPT-5 Omni" },
-      { value: "openai:o1", label: "OpenAI o1" },
-      { value: "openai:gpt-4o", label: "GPT-4o" },
-      { value: "openai:gpt-4o-mini", label: "GPT-4o mini" },
-    ],
-  },
-  {
-    group: "Anthropic Claude",
-    items: [
-      { value: "claude:claude-3-7-sonnet-latest", label: "Claude 3.7 Sonnet" },
-      { value: "claude:claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet (New)" },
-      { value: "claude:claude-3-opus-20240229", label: "Claude 3 Opus" },
-    ],
-  },
-  {
-    group: "Local & Grok",
-    items: [
-      { value: "grok:grok-2", label: "Grok-2" },
-      { value: "local:qwen4:latest", label: "Qwen4 (Local)" },
-      { value: "local:qwen3:latest", label: "Qwen3 (Local)" },
-      { value: "local:qwen2.5:latest", label: "Qwen2.5 (Local)" },
-      { value: "local:llama4:latest", label: "Llama 4 (Local)" },
-      { value: "local:llama3.1:latest", label: "Llama 3.1 (Local)" },
-      { value: "local:mistral:latest", label: "Mistral (Local)" },
-    ],
-  }
-];
 
 export function ChatPromptBox({
   input,
@@ -185,75 +142,104 @@ export function ChatPromptBox({
 
             <Group justify="space-between" align="center">
               <Group gap={8}>
-                <ActionIcon variant="transparent" color="dimmed" size="md">
-                  <IconPlus size={18} />
-                </ActionIcon>
-
-                <MultiSelect
-                  data={allConfigs?.map(c => ({ value: c._id, label: c.name })) || []}
-                  value={selectedConfigIds}
-                  onChange={setSelectedConfigIds}
-                  placeholder="Select Databases"
-                  variant="unstyled"
-                  size="xs"
-                  w={220}
-                  hidePickedOptions={false}
-                  clearable
-                  comboboxProps={{ position: 'top-start', width: 320, shadow: 'xl' }}
-                  rightSection={<IconChevronDown size={10} color="rgba(255,255,255,0.4)" />}
-                  renderOption={({ option }) => {
-                    const config = allConfigs?.find(c => c._id === option.value);
-                    const isSelected = selectedConfigIds.includes(option.value);
-                    return (
-                      <Group gap="sm" wrap="nowrap">
-                        <Checkbox
-                          checked={isSelected}
-                          readOnly
-                          size="xs"
-                          color="violet"
-                          styles={{ input: { cursor: 'pointer' } }}
-                        />
-                        <Avatar
-                          src={config?.image || "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"}
-                          size={24}
-                          radius="xs"
-                          style={{ background: "transparent", opacity: 0.8 }}
-                        />
-                        <Stack gap={2} style={{ flex: 1 }}>
-                          <Text size="xs" fw={700} c="white">{option.label}</Text>
-                          {config?.description && (
-                            <Text size="10px" c="dimmed" style={{ lineHeight: 1.2 }}>
-                              {config.description}
-                            </Text>
-                          )}
-                        </Stack>
-                      </Group>
-                    );
-                  }}
+                <Menu 
+                  closeOnItemClick={false} 
+                  position="top-start" 
+                  width={320} 
+                  shadow="xl"
                   styles={{
-                    root: { width: "220px" },
-                    input: {
-                      color: "rgba(255,255,255,0.6)",
-                      fontWeight: 500,
-                      fontSize: "12px",
-                      background: "transparent",
-                      padding: "0 8px 0 12px"
-                    },
-                    section: { pointerEvents: "none" as const },
                     dropdown: {
                       background: "#161616",
                       borderColor: "rgba(255,255,255,0.1)",
                       borderRadius: "8px",
                       padding: "4px"
                     },
-                    option: {
-                      fontSize: "12px",
-                      color: "rgba(255,255,255,0.6)",
+                    item: {
                       padding: "8px 12px",
                       borderRadius: "6px",
+                      color: "white",
+                      "&:hover": {
+                        background: "rgba(255,255,255,0.05)"
+                      }
                     }
                   }}
-                />
+                >
+                  <Menu.Target>
+                    <Group 
+                      gap={6} 
+                      px="sm" 
+                      py={6} 
+                      style={{ 
+                        cursor: "pointer", 
+                        borderRadius: "8px", 
+                        border: "1px solid rgba(255,255,255,0.1)",
+                        background: "rgba(255,255,255,0.02)",
+                        height: "32px",
+                        minWidth: "150px",
+                        transition: "all 0.15s ease"
+                      }}
+                      className="db-select-pill-hover"
+                    >
+                      <style jsx>{`
+                        .db-select-pill-hover:hover {
+                          background: rgba(255,255,255,0.06) !important;
+                          border-color: rgba(255,255,255,0.2) !important;
+                        }
+                      `}</style>
+                      <IconTable size={14} color="rgba(255,255,255,0.4)" />
+                      <Text size="xs" fw={600} c="rgba(255,255,255,0.8)" style={{ flex: 1 }}>
+                        {selectedConfigIds.length === 0 
+                          ? "Select Databases" 
+                          : `${selectedConfigIds.length} DB${selectedConfigIds.length > 1 ? "s" : ""} Selected`}
+                      </Text>
+                      <IconChevronDown size={10} color="rgba(255,255,255,0.4)" />
+                    </Group>
+                  </Menu.Target>
+                  <Menu.Dropdown>
+                    <Menu.Label c="dimmed" style={{ fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                      Target Databases
+                    </Menu.Label>
+                    {allConfigs?.map((config) => {
+                      const isSelected = selectedConfigIds.includes(config._id);
+                      return (
+                        <Menu.Item
+                          key={config._id}
+                          onClick={() => {
+                            if (isSelected) {
+                              setSelectedConfigIds(selectedConfigIds.filter(id => id !== config._id));
+                            } else {
+                              setSelectedConfigIds([...selectedConfigIds, config._id]);
+                            }
+                          }}
+                        >
+                          <Group gap="sm" wrap="nowrap" style={{ width: "100%" }}>
+                            <Checkbox
+                              checked={isSelected}
+                              readOnly
+                              size="xs"
+                              color="violet"
+                              styles={{ input: { cursor: 'pointer' } }}
+                            />
+                            <Avatar
+                              src={config.image || "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"}
+                              size={24}
+                              radius="xs"
+                              style={{ background: "transparent", opacity: 0.8 }}
+                            />
+                            <Stack gap={2} style={{ flex: 1 }}>
+                              <Text size="xs" fw={700} c="white">{config.name}</Text>
+                              {config.description && (
+                                <Text size="10px" c="dimmed" style={{ lineHeight: 1.2 }}>
+                                  {config.description}
+                                </Text>
+                              )}
+                            </Stack>
+                          </Group>
+                        </Menu.Item>
+                      );
+                    })}
+                  </Menu.Dropdown>
+                </Menu>
 
                 <Select
                   data={MODEL_OPTIONS}
@@ -310,10 +296,6 @@ export function ChatPromptBox({
                     />
                   </Group>
                 </Tooltip>
-
-                <ActionIcon variant="transparent" color="dimmed" size="md">
-                  <IconMicrophone size={18} />
-                </ActionIcon>
 
                 <ActionIcon
                   type="submit"
